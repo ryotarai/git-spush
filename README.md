@@ -18,7 +18,7 @@ go install github.com/ryotarai/git-spush/cmd/git-spush@latest
 Push the current branch to `origin/<current-branch>`:
 
 ```sh
-GH_TOKEN="$(gh auth token)" git-spush
+git-spush
 ```
 
 After the command finishes, your local branch is updated to the GitHub-created
@@ -66,23 +66,23 @@ go build -o git-spush ./cmd/git-spush
 ## Usage
 
 ```sh
-GH_TOKEN="$(gh auth token)" git-spush [remote] [src[:dst]]
+git-spush [remote] [src[:dst]]
 ```
 
 Examples:
 
 ```sh
 # Push current branch to origin/<current-branch>.
-GH_TOKEN="$(gh auth token)" git-spush
+git-spush
 
 # Push local main to origin/main.
-GH_TOKEN="$(gh auth token)" git-spush origin main
+git-spush origin main
 
 # Push HEAD to origin/main.
-GH_TOKEN="$(gh auth token)" git-spush origin HEAD:main
+git-spush origin HEAD:main
 
 # Push topic and set upstream to origin/topic.
-GH_TOKEN="$(gh auth token)" git-spush -u origin topic
+git-spush -u origin topic
 ```
 
 Defaults:
@@ -94,18 +94,19 @@ Defaults:
 
 ## Authentication
 
-`git-spush` needs a GitHub token that can write repository contents. The simplest
-way to run it locally is:
+`git-spush` needs a GitHub token that can write repository contents. For local
+use, authenticating the GitHub CLI is usually enough:
 
 ```sh
-GH_TOKEN="$(gh auth token)" git-spush
+gh auth login
+git-spush
 ```
 
 Token lookup order:
 
-1. `GH_TOKEN`
-2. `GITHUB_TOKEN`
-3. `git config --get github.token`
+1. `GITHUB_TOKEN`
+2. `git config --get github.token`
+3. `gh auth token`
 
 ## Safety Model
 

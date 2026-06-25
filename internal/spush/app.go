@@ -474,9 +474,6 @@ func localCommits(ctx context.Context, git GitRunner, baseRef, headRef string) (
 }
 
 func githubToken(ctx context.Context, git GitRunner, env map[string]string) (string, error) {
-	if token := env["GH_TOKEN"]; token != "" {
-		return token, nil
-	}
 	if token := env["GITHUB_TOKEN"]; token != "" {
 		return token, nil
 	}
@@ -484,7 +481,17 @@ func githubToken(ctx context.Context, git GitRunner, env map[string]string) (str
 	if err == nil && token != "" {
 		return token, nil
 	}
-	return "", errors.New("set GH_TOKEN or GITHUB_TOKEN with a GitHub token that can create commits")
+	cmd := exec.CommandContext(ctx, "gh", "auth", "token")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		return strings.TrimSpace(string(out)), nil
+	}
+	if err != nil && strings.TrimSpace(stderr.String()) != "" {
+		return "", fmt.Errorf("set GITHUB_TOKEN or git config github.token, or authenticate gh: %s", strings.TrimSpace(stderr.String()))
+	}
+	return "", errors.New("set GITHUB_TOKEN or git config github.token, or authenticate gh")
 }
 
 func ensureCleanWorktree(ctx context.Context, git GitRunner) error {
@@ -520,7 +527,6 @@ func envMap(env []string) map[string]string {
 	}
 	if len(out) == 0 {
 		return map[string]string{
-			"GH_TOKEN":           os.Getenv("GH_TOKEN"),
 			"GITHUB_TOKEN":       os.Getenv("GITHUB_TOKEN"),
 			"GITHUB_GRAPHQL_URL": os.Getenv("GITHUB_GRAPHQL_URL"),
 		}

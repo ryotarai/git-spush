@@ -199,7 +199,7 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 	client := &fakeCommitClient{oid: "signed-oid"}
 	var out strings.Builder
 
-	err := runWithDeps(context.Background(), []string{}, map[string]string{"GH_TOKEN": "token"}, &out, git, client)
+	err := runWithDeps(context.Background(), []string{}, map[string]string{"GITHUB_TOKEN": "token"}, &out, git, client)
 	if err != nil {
 		t.Fatalf("runWithDeps returned error: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestRunWithDepsCreatesOneSignedCommitPerLocalCommit(t *testing.T) {
 	})
 	client := &fakeCommitClient{oids: []string{"signed-1", "signed-2"}}
 
-	err := runWithDeps(context.Background(), nil, map[string]string{"GH_TOKEN": "token"}, io.Discard, git, client)
+	err := runWithDeps(context.Background(), nil, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, git, client)
 	if err != nil {
 		t.Fatalf("runWithDeps returned error: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestRunWithDepsSetUpstreamConfiguresTrackingBranch(t *testing.T) {
 	})
 	client := &fakeCommitClient{oid: "signed-oid"}
 
-	err := runWithDeps(context.Background(), []string{"-u", "origin", "topic"}, map[string]string{"GH_TOKEN": "token"}, io.Discard, git, client)
+	err := runWithDeps(context.Background(), []string{"-u", "origin", "topic"}, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, git, client)
 	if err != nil {
 		t.Fatalf("runWithDeps returned error: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestRunWithDepsRejectsDirtyWorktreeBeforeCreatingCommit(t *testing.T) {
 	git.errors = map[string]error{"git diff --quiet": fmt.Errorf("dirty")}
 	client := &fakeCommitClient{oid: "signed-oid"}
 
-	err := runWithDeps(context.Background(), nil, map[string]string{"GH_TOKEN": "token"}, io.Discard, git, client)
+	err := runWithDeps(context.Background(), nil, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, git, client)
 	if err == nil {
 		t.Fatal("runWithDeps returned nil error for dirty worktree")
 	}
@@ -318,6 +318,37 @@ func TestRunWithDepsRejectsDirtyWorktreeBeforeCreatingCommit(t *testing.T) {
 	}
 	if client.input.RepositoryNameWithOwner != "" {
 		t.Fatalf("client was called despite dirty worktree: %#v", client.input)
+	}
+}
+
+func TestGitHubTokenIgnoresGHToken(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git config --get github.token": "config-token\n",
+	})
+
+	token, err := githubToken(context.Background(), git, map[string]string{
+		"GH_TOKEN": "ignored-token",
+	})
+	if err != nil {
+		t.Fatalf("githubToken returned error: %v", err)
+	}
+	if token != "config-token" {
+		t.Fatalf("token = %q, want config-token", token)
+	}
+}
+
+func TestGitHubTokenPrefersGitHubToken(t *testing.T) {
+	git := newFakeGit(nil)
+
+	token, err := githubToken(context.Background(), git, map[string]string{
+		"GITHUB_TOKEN": "env-token",
+		"GH_TOKEN":     "ignored-token",
+	})
+	if err != nil {
+		t.Fatalf("githubToken returned error: %v", err)
+	}
+	if token != "env-token" {
+		t.Fatalf("token = %q, want env-token", token)
 	}
 }
 
