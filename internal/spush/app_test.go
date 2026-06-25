@@ -183,12 +183,15 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 	git := newFakeGit(map[string]string{
 		"git branch --show-current":                         "main\n",
 		"git remote get-url origin":                         "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":                                  "",
+		"git diff --cached --quiet":                         "",
 		"git rev-parse HEAD":                                "local-oid\n",
 		"git rev-parse origin/main":                         "remote-oid\n",
 		"git merge-base --is-ancestor remote-oid local-oid": "",
 		"git diff --name-status -z origin/main HEAD":        "M\x00README.md\x00",
 		"git show HEAD:README.md":                           "hello",
 		"git log -1 --format=%B HEAD":                       "update readme\n\nbody\n",
+		"git reset --hard remote-oid":                       "",
 		"git pull --ff-only origin main":                    "",
 	})
 	client := &fakeCommitClient{oid: "signed-oid"}
@@ -210,6 +213,9 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 	if !slices.Contains(git.calls, "git pull --ff-only origin main") {
 		t.Fatalf("git calls = %#v, want pull after create", git.calls)
 	}
+	if !calledBefore(git.calls, "git reset --hard remote-oid", "git pull --ff-only origin main") {
+		t.Fatalf("git calls = %#v, want reset to old remote head before pull", git.calls)
+	}
 	if !strings.Contains(out.String(), "signed-oid") {
 		t.Fatalf("output = %q, want signed oid", out.String())
 	}
@@ -218,12 +224,15 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 func TestRunWithDepsSetUpstreamConfiguresTrackingBranch(t *testing.T) {
 	git := newFakeGit(map[string]string{
 		"git remote get-url origin":                         "https://github.com/ryotarai/git-spush.git\n",
+		"git diff --quiet":                                  "",
+		"git diff --cached --quiet":                         "",
 		"git rev-parse topic":                               "local-oid\n",
 		"git rev-parse origin/topic":                        "remote-oid\n",
 		"git merge-base --is-ancestor remote-oid local-oid": "",
 		"git diff --name-status -z origin/topic topic":      "M\x00README.md\x00",
 		"git show topic:README.md":                          "hello",
 		"git log -1 --format=%B topic":                      "update readme\n",
+		"git reset --hard remote-oid":                       "",
 		"git pull --ff-only origin topic":                   "",
 		"git branch --set-upstream-to=origin/topic topic":   "",
 	})
@@ -238,8 +247,29 @@ func TestRunWithDepsSetUpstreamConfiguresTrackingBranch(t *testing.T) {
 	}
 }
 
+func TestRunWithDepsRejectsDirtyWorktreeBeforeCreatingCommit(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git branch --show-current": "main\n",
+		"git remote get-url origin": "git@github.com:ryotarai/git-spush.git\n",
+	})
+	git.errors = map[string]error{"git diff --quiet": fmt.Errorf("dirty")}
+	client := &fakeCommitClient{oid: "signed-oid"}
+
+	err := runWithDeps(context.Background(), nil, map[string]string{"GH_TOKEN": "token"}, io.Discard, git, client)
+	if err == nil {
+		t.Fatal("runWithDeps returned nil error for dirty worktree")
+	}
+	if !strings.Contains(err.Error(), "uncommitted") {
+		t.Fatalf("error = %q, want uncommitted changes message", err)
+	}
+	if client.input.RepositoryNameWithOwner != "" {
+		t.Fatalf("client was called despite dirty worktree: %#v", client.input)
+	}
+}
+
 type fakeGit struct {
 	outputs map[string]string
+	errors  map[string]error
 	calls   []string
 }
 
@@ -250,6 +280,9 @@ func newFakeGit(outputs map[string]string) *fakeGit {
 func (g *fakeGit) Run(ctx context.Context, args ...string) (string, error) {
 	key := "git " + strings.Join(args, " ")
 	g.calls = append(g.calls, key)
+	if err, ok := g.errors[key]; ok {
+		return "", err
+	}
 	out, ok := g.outputs[key]
 	if !ok {
 		return "", fmt.Errorf("unexpected git command: %s", key)
@@ -265,4 +298,10 @@ type fakeCommitClient struct {
 func (c *fakeCommitClient) CreateCommitOnBranch(ctx context.Context, input CreateCommitInput) (string, error) {
 	c.input = input
 	return c.oid, nil
+}
+
+func calledBefore(calls []string, first, second string) bool {
+	firstIndex := slices.Index(calls, first)
+	secondIndex := slices.Index(calls, second)
+	return firstIndex >= 0 && secondIndex >= 0 && firstIndex < secondIndex
 }

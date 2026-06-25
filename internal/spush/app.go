@@ -84,6 +84,10 @@ type GitHubClient struct {
 	httpClient *http.Client
 }
 
+type commitClient interface {
+	CreateCommitOnBranch(ctx context.Context, input CreateCommitInput) (string, error)
+}
+
 func NewGitHubClient(endpoint, token string) *GitHubClient {
 	if endpoint == "" {
 		endpoint = defaultGitHubGraphQLEndpoint
@@ -100,12 +104,17 @@ func Main(ctx context.Context, args []string, env []string, stdout, stderr io.Wr
 }
 
 func Run(ctx context.Context, args []string, env []string, stdout io.Writer) error {
+	environment := envMap(env)
+	endpoint := environment["GITHUB_GRAPHQL_URL"]
+	client := NewGitHubClient(endpoint, "")
+	return runWithDeps(ctx, args, environment, stdout, execGit{}, client)
+}
+
+func runWithDeps(ctx context.Context, args []string, environment map[string]string, stdout io.Writer, git GitRunner, client commitClient) error {
 	options, err := ParsePushArgs(args)
 	if err != nil {
 		return err
 	}
-	git := execGit{}
-	environment := envMap(env)
 
 	if options.RemoteBranch == "" {
 		branch, err := currentBranch(ctx, git)
@@ -121,6 +130,10 @@ func Run(ctx context.Context, args []string, env []string, stdout io.Writer) err
 	}
 	remote, err := ParseGitHubRemote(strings.TrimSpace(remoteURL))
 	if err != nil {
+		return err
+	}
+
+	if err := ensureCleanWorktree(ctx, git); err != nil {
 		return err
 	}
 
@@ -158,8 +171,9 @@ func Run(ctx context.Context, args []string, env []string, stdout io.Writer) err
 	if err != nil {
 		return err
 	}
-	endpoint := environment["GITHUB_GRAPHQL_URL"]
-	client := NewGitHubClient(endpoint, token)
+	if githubClient, ok := client.(*GitHubClient); ok {
+		githubClient.token = token
+	}
 	oid, err := client.CreateCommitOnBranch(ctx, CreateCommitInput{
 		RepositoryNameWithOwner: remote.NameWithOwner(),
 		BranchName:              options.RemoteBranch,
@@ -172,9 +186,18 @@ func Run(ctx context.Context, args []string, env []string, stdout io.Writer) err
 		return err
 	}
 
+	if _, err := git.Run(ctx, "reset", "--hard", remoteOID); err != nil {
+		return fmt.Errorf("created commit %s, but resetting local branch before pull failed: %w", oid, err)
+	}
 	pullArgs := []string{"pull", "--ff-only", options.Remote, options.RemoteBranch}
 	if _, err := git.Run(ctx, pullArgs...); err != nil {
 		return fmt.Errorf("created commit %s, but git pull failed: %w", oid, err)
+	}
+	if options.SetUpstream {
+		upstream := options.Remote + "/" + options.RemoteBranch
+		if _, err := git.Run(ctx, "branch", "--set-upstream-to="+upstream, options.LocalRef); err != nil {
+			return fmt.Errorf("created commit %s and pulled it, but setting upstream failed: %w", oid, err)
+		}
 	}
 	fmt.Fprintf(stdout, "Created GitHub-signed commit %s and updated local branch\n", oid)
 	return nil
@@ -421,6 +444,16 @@ func githubToken(ctx context.Context, git GitRunner, env map[string]string) (str
 		return token, nil
 	}
 	return "", errors.New("set GH_TOKEN or GITHUB_TOKEN with a GitHub token that can create commits")
+}
+
+func ensureCleanWorktree(ctx context.Context, git GitRunner) error {
+	if _, err := git.Run(ctx, "diff", "--quiet"); err != nil {
+		return errors.New("working tree has uncommitted changes; commit or stash them before git-spush")
+	}
+	if _, err := git.Run(ctx, "diff", "--cached", "--quiet"); err != nil {
+		return errors.New("index has uncommitted changes; commit or stash them before git-spush")
+	}
+	return nil
 }
 
 func trimmedGit(ctx context.Context, git GitRunner, args ...string) (string, error) {
