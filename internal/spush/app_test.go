@@ -185,12 +185,14 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 		"git remote get-url origin":                         "git@github.com:ryotarai/git-spush.git\n",
 		"git diff --quiet":                                  "",
 		"git diff --cached --quiet":                         "",
+		"git fetch origin main":                             "",
 		"git rev-parse HEAD":                                "local-oid\n",
 		"git rev-parse origin/main":                         "remote-oid\n",
 		"git merge-base --is-ancestor remote-oid local-oid": "",
-		"git diff --name-status -z origin/main HEAD":        "M\x00README.md\x00",
-		"git show HEAD:README.md":                           "hello",
-		"git log -1 --format=%B HEAD":                       "update readme\n\nbody\n",
+		"git rev-list --reverse origin/main..HEAD":          "commit-1\n",
+		"git diff --name-status -z origin/main commit-1":    "M\x00README.md\x00",
+		"git show commit-1:README.md":                       "hello",
+		"git log -1 --format=%B commit-1":                   "update readme\n\nbody\n",
 		"git reset --hard remote-oid":                       "",
 		"git pull --ff-only origin main":                    "",
 	})
@@ -221,14 +223,66 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 	}
 }
 
+func TestRunWithDepsCreatesOneSignedCommitPerLocalCommit(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git branch --show-current":                        "main\n",
+		"git remote get-url origin":                        "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":                                 "",
+		"git diff --cached --quiet":                        "",
+		"git fetch origin main":                            "",
+		"git rev-parse HEAD":                               "commit-2\n",
+		"git rev-parse origin/main":                        "remote-oid\n",
+		"git merge-base --is-ancestor remote-oid commit-2": "",
+		"git rev-list --reverse origin/main..HEAD":         "commit-1\ncommit-2\n",
+		"git diff --name-status -z origin/main commit-1":   "A\x00one.txt\x00",
+		"git show commit-1:one.txt":                        "one",
+		"git log -1 --format=%B commit-1":                  "first local commit\n\nfirst body\n",
+		"git diff --name-status -z commit-1 commit-2":      "M\x00one.txt\x00A\x00two.txt\x00",
+		"git show commit-2:one.txt":                        "one updated",
+		"git show commit-2:two.txt":                        "two",
+		"git log -1 --format=%B commit-2":                  "second local commit\n",
+		"git reset --hard remote-oid":                      "",
+		"git pull --ff-only origin main":                   "",
+	})
+	client := &fakeCommitClient{oids: []string{"signed-1", "signed-2"}}
+
+	err := runWithDeps(context.Background(), nil, map[string]string{"GH_TOKEN": "token"}, io.Discard, git, client)
+	if err != nil {
+		t.Fatalf("runWithDeps returned error: %v", err)
+	}
+	if len(client.inputs) != 2 {
+		t.Fatalf("created %d commits, want 2: %#v", len(client.inputs), client.inputs)
+	}
+	first := client.inputs[0]
+	if first.ExpectedHeadOID != "remote-oid" || first.MessageHeadline != "first local commit" || first.MessageBody != "first body" {
+		t.Fatalf("first input = %#v", first)
+	}
+	if !slices.Equal(first.FileChanges.Additions, []FileAddition{{Path: "one.txt", Contents: "one"}}) {
+		t.Fatalf("first additions = %#v", first.FileChanges.Additions)
+	}
+	second := client.inputs[1]
+	if second.ExpectedHeadOID != "signed-1" || second.MessageHeadline != "second local commit" {
+		t.Fatalf("second input = %#v", second)
+	}
+	wantSecondAdditions := []FileAddition{{Path: "one.txt", Contents: "one updated"}, {Path: "two.txt", Contents: "two"}}
+	if !slices.Equal(second.FileChanges.Additions, wantSecondAdditions) {
+		t.Fatalf("second additions = %#v, want %#v", second.FileChanges.Additions, wantSecondAdditions)
+	}
+	if !calledBefore(git.calls, "git diff --name-status -z origin/main commit-1", "git diff --name-status -z commit-1 commit-2") {
+		t.Fatalf("git calls = %#v, want per-commit diffs in order", git.calls)
+	}
+}
+
 func TestRunWithDepsSetUpstreamConfiguresTrackingBranch(t *testing.T) {
 	git := newFakeGit(map[string]string{
 		"git remote get-url origin":                         "https://github.com/ryotarai/git-spush.git\n",
 		"git diff --quiet":                                  "",
 		"git diff --cached --quiet":                         "",
+		"git fetch origin topic":                            "",
 		"git rev-parse topic":                               "local-oid\n",
 		"git rev-parse origin/topic":                        "remote-oid\n",
 		"git merge-base --is-ancestor remote-oid local-oid": "",
+		"git rev-list --reverse origin/topic..topic":        "topic\n",
 		"git diff --name-status -z origin/topic topic":      "M\x00README.md\x00",
 		"git show topic:README.md":                          "hello",
 		"git log -1 --format=%B topic":                      "update readme\n",
@@ -291,12 +345,20 @@ func (g *fakeGit) Run(ctx context.Context, args ...string) (string, error) {
 }
 
 type fakeCommitClient struct {
-	oid   string
-	input CreateCommitInput
+	oid    string
+	oids   []string
+	input  CreateCommitInput
+	inputs []CreateCommitInput
 }
 
 func (c *fakeCommitClient) CreateCommitOnBranch(ctx context.Context, input CreateCommitInput) (string, error) {
 	c.input = input
+	c.inputs = append(c.inputs, input)
+	if len(c.oids) > 0 {
+		oid := c.oids[0]
+		c.oids = c.oids[1:]
+		return oid, nil
+	}
 	return c.oid, nil
 }
 

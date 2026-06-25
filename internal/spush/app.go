@@ -137,6 +137,10 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 		return err
 	}
 
+	if _, err := git.Run(ctx, "fetch", options.Remote, options.RemoteBranch); err != nil {
+		return err
+	}
+
 	localOID, err := trimmedGit(ctx, git, "rev-parse", options.LocalRef)
 	if err != nil {
 		return err
@@ -154,19 +158,15 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 		return fmt.Errorf("remote %s is not an ancestor of %s; non-fast-forward pushes are not supported", remoteRef, options.LocalRef)
 	}
 
-	changes, err := BuildFileChanges(ctx, git, remoteRef, options.LocalRef)
+	commits, err := localCommits(ctx, git, remoteRef, options.LocalRef)
 	if err != nil {
 		return err
 	}
-	if len(changes.Additions) == 0 && len(changes.Deletions) == 0 {
+	if len(commits) == 0 {
 		fmt.Fprintln(stdout, "Everything up-to-date")
 		return nil
 	}
 
-	headline, body, err := commitMessage(ctx, git, options.LocalRef)
-	if err != nil {
-		return err
-	}
 	token, err := githubToken(ctx, git, environment)
 	if err != nil {
 		return err
@@ -174,32 +174,61 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 	if githubClient, ok := client.(*GitHubClient); ok {
 		githubClient.token = token
 	}
-	oid, err := client.CreateCommitOnBranch(ctx, CreateCommitInput{
-		RepositoryNameWithOwner: remote.NameWithOwner(),
-		BranchName:              options.RemoteBranch,
-		ExpectedHeadOID:         remoteOID,
-		MessageHeadline:         headline,
-		MessageBody:             body,
-		FileChanges:             changes,
-	})
-	if err != nil {
-		return err
+
+	expectedHeadOID := remoteOID
+	baseRef := remoteRef
+	createdOIDs := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		changes, err := BuildFileChanges(ctx, git, baseRef, commit)
+		if err != nil {
+			return err
+		}
+		if len(changes.Additions) == 0 && len(changes.Deletions) == 0 {
+			baseRef = commit
+			continue
+		}
+		headline, body, err := commitMessage(ctx, git, commit)
+		if err != nil {
+			return err
+		}
+		oid, err := client.CreateCommitOnBranch(ctx, CreateCommitInput{
+			RepositoryNameWithOwner: remote.NameWithOwner(),
+			BranchName:              options.RemoteBranch,
+			ExpectedHeadOID:         expectedHeadOID,
+			MessageHeadline:         headline,
+			MessageBody:             body,
+			FileChanges:             changes,
+		})
+		if err != nil {
+			return err
+		}
+		createdOIDs = append(createdOIDs, oid)
+		expectedHeadOID = oid
+		baseRef = commit
+	}
+	if len(createdOIDs) == 0 {
+		fmt.Fprintln(stdout, "Everything up-to-date")
+		return nil
 	}
 
 	if _, err := git.Run(ctx, "reset", "--hard", remoteOID); err != nil {
-		return fmt.Errorf("created commit %s, but resetting local branch before pull failed: %w", oid, err)
+		return fmt.Errorf("created %d commits, but resetting local branch before pull failed: %w", len(createdOIDs), err)
 	}
 	pullArgs := []string{"pull", "--ff-only", options.Remote, options.RemoteBranch}
 	if _, err := git.Run(ctx, pullArgs...); err != nil {
-		return fmt.Errorf("created commit %s, but git pull failed: %w", oid, err)
+		return fmt.Errorf("created %d commits, but git pull failed: %w", len(createdOIDs), err)
 	}
 	if options.SetUpstream {
 		upstream := options.Remote + "/" + options.RemoteBranch
 		if _, err := git.Run(ctx, "branch", "--set-upstream-to="+upstream, options.LocalRef); err != nil {
-			return fmt.Errorf("created commit %s and pulled it, but setting upstream failed: %w", oid, err)
+			return fmt.Errorf("created %d commits and pulled them, but setting upstream failed: %w", len(createdOIDs), err)
 		}
 	}
-	fmt.Fprintf(stdout, "Created GitHub-signed commit %s and updated local branch\n", oid)
+	if len(createdOIDs) == 1 {
+		fmt.Fprintf(stdout, "Created GitHub-signed commit %s and updated local branch\n", createdOIDs[0])
+		return nil
+	}
+	fmt.Fprintf(stdout, "Created %d GitHub-signed commits and updated local branch\n", len(createdOIDs))
 	return nil
 }
 
@@ -430,6 +459,18 @@ func commitMessage(ctx context.Context, git GitRunner, ref string) (string, stri
 		body = strings.TrimSpace(strings.Join(lines[1:], "\n"))
 	}
 	return headline, body, nil
+}
+
+func localCommits(ctx context.Context, git GitRunner, baseRef, headRef string) ([]string, error) {
+	out, err := git.Run(ctx, "rev-list", "--reverse", baseRef+".."+headRef)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return nil, nil
+	}
+	return lines, nil
 }
 
 func githubToken(ctx context.Context, git GitRunner, env map[string]string) (string, error) {
