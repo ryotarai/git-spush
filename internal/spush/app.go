@@ -88,6 +88,11 @@ type commitClient interface {
 	CreateCommitOnBranch(ctx context.Context, input CreateCommitInput) (string, error)
 }
 
+type refClient interface {
+	RepositoryID(ctx context.Context, remote GitHubRemote) (string, error)
+	CreateRef(ctx context.Context, repositoryID, name, oid string) error
+}
+
 func NewGitHubClient(endpoint, token string) *GitHubClient {
 	if endpoint == "" {
 		endpoint = defaultGitHubGraphQLEndpoint
@@ -137,15 +142,19 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 		return err
 	}
 
-	if _, err := git.Run(ctx, "fetch", options.Remote, options.RemoteBranch); err != nil {
+	remoteRef := options.Remote + "/" + options.RemoteBranch
+	remoteBranchExists, err := fetchRemoteBranch(ctx, git, options.Remote, options.RemoteBranch)
+	if err != nil {
 		return err
+	}
+	if !remoteBranchExists {
+		return createNewRemoteBranch(ctx, git, client, remote, options, remoteRef, environment, stdout)
 	}
 
 	localOID, err := trimmedGit(ctx, git, "rev-parse", options.LocalRef)
 	if err != nil {
 		return err
 	}
-	remoteRef := options.Remote + "/" + options.RemoteBranch
 	remoteOID, err := trimmedGit(ctx, git, "rev-parse", remoteRef)
 	if err != nil {
 		return fmt.Errorf("resolve remote ref %q: %w", remoteRef, err)
@@ -403,11 +412,129 @@ func (c *GitHubClient) CreateCommitOnBranch(ctx context.Context, input CreateCom
 	return decoded.Data.CreateCommitOnBranch.Commit.OID, nil
 }
 
+func (c *GitHubClient) RepositoryID(ctx context.Context, remote GitHubRemote) (string, error) {
+	variables := map[string]any{"owner": remote.Owner, "name": remote.Repo}
+	body, err := json.Marshal(map[string]any{"query": repositoryIDQuery, "variables": variables})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("GitHub GraphQL HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	var decoded struct {
+		Data struct {
+			Repository struct {
+				ID string `json:"id"`
+			} `json:"repository"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(respBody, &decoded); err != nil {
+		return "", err
+	}
+	if len(decoded.Errors) > 0 {
+		return "", fmt.Errorf("GitHub GraphQL error: %s", decoded.Errors[0].Message)
+	}
+	if decoded.Data.Repository.ID == "" {
+		return "", errors.New("GitHub GraphQL response did not include repository id")
+	}
+	return decoded.Data.Repository.ID, nil
+}
+
+func (c *GitHubClient) CreateRef(ctx context.Context, repositoryID, name, oid string) error {
+	variables := map[string]any{
+		"input": map[string]any{
+			"repositoryId": repositoryID,
+			"name":         name,
+			"oid":          oid,
+		},
+	}
+	body, err := json.Marshal(map[string]any{"query": createRefMutation, "variables": variables})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("GitHub GraphQL HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	var decoded struct {
+		Data struct {
+			CreateRef struct {
+				Ref struct {
+					ID string `json:"id"`
+				} `json:"ref"`
+			} `json:"createRef"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(respBody, &decoded); err != nil {
+		return err
+	}
+	if len(decoded.Errors) > 0 {
+		return fmt.Errorf("GitHub GraphQL error: %s", decoded.Errors[0].Message)
+	}
+	if decoded.Data.CreateRef.Ref.ID == "" {
+		return errors.New("GitHub GraphQL response did not include ref id")
+	}
+	return nil
+}
+
 const createCommitOnBranchMutation = `
 mutation CreateCommitOnBranch($input: CreateCommitOnBranchInput!) {
   createCommitOnBranch(input: $input) {
     commit {
       oid
+    }
+  }
+}`
+
+const repositoryIDQuery = `
+query RepositoryID($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    id
+  }
+}`
+
+const createRefMutation = `
+mutation CreateRef($input: CreateRefInput!) {
+  createRef(input: $input) {
+    ref {
+      id
     }
   }
 }`
@@ -476,6 +603,18 @@ func localCommits(ctx context.Context, git GitRunner, baseRef, headRef string) (
 	return lines, nil
 }
 
+func newRemoteBranchCommits(ctx context.Context, git GitRunner, remote, headRef string) ([]string, error) {
+	out, err := git.Run(ctx, "rev-list", "--reverse", headRef, "--not", "--remotes="+remote)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return nil, nil
+	}
+	return lines, nil
+}
+
 func githubToken(ctx context.Context, git GitRunner, env map[string]string) (string, error) {
 	if token := env["GITHUB_TOKEN"]; token != "" {
 		return token, nil
@@ -521,6 +660,133 @@ func verifyCreatedRemoteBeforeReset(ctx context.Context, git GitRunner, remote, 
 	if _, err := git.Run(ctx, "diff", "--quiet", localRef, remoteRef); err != nil {
 		return fmt.Errorf("created remote commits, but remote tree verification failed before reset: %s differs from %s", remoteRef, localRef)
 	}
+	return nil
+}
+
+func fetchRemoteBranch(ctx context.Context, git GitRunner, remote, remoteBranch string) (bool, error) {
+	if _, err := git.Run(ctx, "fetch", remote, remoteBranch); err != nil {
+		if isMissingRemoteRefError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func isMissingRemoteRefError(err error) bool {
+	return strings.Contains(err.Error(), "couldn't find remote ref")
+}
+
+func createNewRemoteBranch(ctx context.Context, git GitRunner, client commitClient, remote GitHubRemote, options PushOptions, remoteRef string, environment map[string]string, stdout io.Writer) error {
+	refCreator, ok := client.(refClient)
+	if !ok {
+		return errors.New("GitHub client does not support creating refs")
+	}
+	if _, err := git.Run(ctx, "fetch", options.Remote); err != nil {
+		return err
+	}
+	localOID, err := trimmedGit(ctx, git, "rev-parse", options.LocalRef)
+	if err != nil {
+		return err
+	}
+	commits, err := newRemoteBranchCommits(ctx, git, options.Remote, options.LocalRef)
+	if err != nil {
+		return err
+	}
+
+	token, err := githubToken(ctx, git, environment)
+	if err != nil {
+		return err
+	}
+	if githubClient, ok := client.(*GitHubClient); ok {
+		githubClient.token = token
+	}
+	repositoryID, err := refCreator.RepositoryID(ctx, remote)
+	if err != nil {
+		return err
+	}
+
+	if len(commits) == 0 {
+		if err := refCreator.CreateRef(ctx, repositoryID, "refs/heads/"+options.RemoteBranch, localOID); err != nil {
+			return err
+		}
+		if err := verifyCreatedRemoteBeforeReset(ctx, git, options.Remote, options.RemoteBranch, remoteRef, options.LocalRef, localOID); err != nil {
+			return err
+		}
+		if options.SetUpstream {
+			upstream := options.Remote + "/" + options.RemoteBranch
+			if _, err := git.Run(ctx, "branch", "--set-upstream-to="+upstream, options.LocalRef); err != nil {
+				return fmt.Errorf("created remote branch, but setting upstream failed: %w", err)
+			}
+		}
+		fmt.Fprintf(stdout, "Created remote branch %s\n", remoteRef)
+		return nil
+	}
+
+	baseOID, err := trimmedGit(ctx, git, "rev-parse", commits[0]+"^")
+	if err != nil {
+		return fmt.Errorf("resolve new branch base for %s: %w", commits[0], err)
+	}
+	if err := refCreator.CreateRef(ctx, repositoryID, "refs/heads/"+options.RemoteBranch, baseOID); err != nil {
+		return err
+	}
+
+	expectedHeadOID := baseOID
+	baseRef := baseOID
+	createdOIDs := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		changes, err := BuildFileChanges(ctx, git, baseRef, commit)
+		if err != nil {
+			return err
+		}
+		if len(changes.Additions) == 0 && len(changes.Deletions) == 0 {
+			baseRef = commit
+			continue
+		}
+		headline, body, err := commitMessage(ctx, git, commit)
+		if err != nil {
+			return err
+		}
+		oid, err := client.CreateCommitOnBranch(ctx, CreateCommitInput{
+			RepositoryNameWithOwner: remote.NameWithOwner(),
+			BranchName:              options.RemoteBranch,
+			ExpectedHeadOID:         expectedHeadOID,
+			MessageHeadline:         headline,
+			MessageBody:             body,
+			FileChanges:             changes,
+		})
+		if err != nil {
+			return err
+		}
+		createdOIDs = append(createdOIDs, oid)
+		expectedHeadOID = oid
+		baseRef = commit
+	}
+	if len(createdOIDs) == 0 {
+		fmt.Fprintln(stdout, "Everything up-to-date")
+		return nil
+	}
+	if err := verifyCreatedRemoteBeforeReset(ctx, git, options.Remote, options.RemoteBranch, remoteRef, options.LocalRef, expectedHeadOID); err != nil {
+		return err
+	}
+	if _, err := git.Run(ctx, "reset", "--hard", baseOID); err != nil {
+		return fmt.Errorf("created %d commits, but resetting local branch before pull failed: %w", len(createdOIDs), err)
+	}
+	pullArgs := []string{"pull", "--ff-only", options.Remote, options.RemoteBranch}
+	if _, err := git.Run(ctx, pullArgs...); err != nil {
+		return fmt.Errorf("created %d commits, but git pull failed: %w", len(createdOIDs), err)
+	}
+	if options.SetUpstream {
+		upstream := options.Remote + "/" + options.RemoteBranch
+		if _, err := git.Run(ctx, "branch", "--set-upstream-to="+upstream, options.LocalRef); err != nil {
+			return fmt.Errorf("created %d commits and pulled them, but setting upstream failed: %w", len(createdOIDs), err)
+		}
+	}
+	if len(createdOIDs) == 1 {
+		fmt.Fprintf(stdout, "Created GitHub-signed commit %s and updated local branch\n", createdOIDs[0])
+		return nil
+	}
+	fmt.Fprintf(stdout, "Created %d GitHub-signed commits and updated local branch\n", len(createdOIDs))
 	return nil
 }
 

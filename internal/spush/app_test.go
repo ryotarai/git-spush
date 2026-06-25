@@ -179,6 +179,68 @@ func TestCreateCommitOnBranchRequest(t *testing.T) {
 	}
 }
 
+func TestRepositoryIDRequest(t *testing.T) {
+	var got struct {
+		Query     string         `json:"query"`
+		Variables map[string]any `json:"variables"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "Bearer token-123" {
+			t.Fatalf("Authorization = %q, want Bearer token-123", auth)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		fmt.Fprint(w, `{"data":{"repository":{"id":"repo-id"}}}`)
+	}))
+	defer server.Close()
+
+	client := NewGitHubClient(server.URL, "token-123")
+	id, err := client.RepositoryID(context.Background(), GitHubRemote{Owner: "ryotarai", Repo: "git-spush"})
+	if err != nil {
+		t.Fatalf("RepositoryID returned error: %v", err)
+	}
+	if id != "repo-id" {
+		t.Fatalf("id = %q, want repo-id", id)
+	}
+	if !strings.Contains(got.Query, "repository") {
+		t.Fatalf("query does not contain repository lookup: %s", got.Query)
+	}
+	if got.Variables["owner"] != "ryotarai" || got.Variables["name"] != "git-spush" {
+		t.Fatalf("variables = %#v", got.Variables)
+	}
+}
+
+func TestCreateRefRequest(t *testing.T) {
+	var got struct {
+		Query     string         `json:"query"`
+		Variables map[string]any `json:"variables"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "Bearer token-123" {
+			t.Fatalf("Authorization = %q, want Bearer token-123", auth)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		fmt.Fprint(w, `{"data":{"createRef":{"ref":{"id":"ref-id"}}}}`)
+	}))
+	defer server.Close()
+
+	client := NewGitHubClient(server.URL, "token-123")
+	err := client.CreateRef(context.Background(), "repo-id", "refs/heads/topic", "base-oid")
+	if err != nil {
+		t.Fatalf("CreateRef returned error: %v", err)
+	}
+	if !strings.Contains(got.Query, "createRef") {
+		t.Fatalf("query does not contain createRef mutation: %s", got.Query)
+	}
+	input := got.Variables["input"].(map[string]any)
+	if input["repositoryId"] != "repo-id" || input["name"] != "refs/heads/topic" || input["oid"] != "base-oid" {
+		t.Fatalf("input = %#v", input)
+	}
+}
+
 func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 	git := newFakeGit(map[string]string{
 		"git branch --show-current":                         "main\n",
@@ -226,6 +288,59 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "signed-oid") {
 		t.Fatalf("output = %q, want signed oid", out.String())
+	}
+}
+
+func TestRunWithDepsCreatesNewRemoteBranchAndSignedCommits(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git remote get-url origin":                           "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":                                    "",
+		"git diff --cached --quiet":                           "",
+		"git fetch origin topic":                              "",
+		"git fetch origin":                                    "",
+		"git rev-parse topic":                                 "commit-2\n",
+		"git rev-list --reverse topic --not --remotes=origin": "commit-1\ncommit-2\n",
+		"git rev-parse commit-1^":                             "base-oid\n",
+		"git diff --name-status -z base-oid commit-1":         "A\x00one.txt\x00",
+		"git show commit-1:one.txt":                           "one",
+		"git log -1 --format=%B commit-1":                     "first local commit\n",
+		"git diff --name-status -z commit-1 commit-2":         "M\x00one.txt\x00A\x00two.txt\x00",
+		"git show commit-2:one.txt":                           "one updated",
+		"git show commit-2:two.txt":                           "two",
+		"git log -1 --format=%B commit-2":                     "second local commit\n",
+		"git diff --quiet topic origin/topic":                 "",
+		"git reset --hard base-oid":                           "",
+		"git pull --ff-only origin topic":                     "",
+	})
+	git.errorsSeq = map[string][]error{
+		"git fetch origin topic": {fmt.Errorf("git fetch origin topic: fatal: couldn't find remote ref topic"), nil},
+	}
+	git.outputsSeq = map[string][]string{
+		"git rev-parse origin/topic": {"signed-2\n"},
+	}
+	client := &fakeCommitClient{repoID: "repo-id", oids: []string{"signed-1", "signed-2"}}
+
+	err := runWithDeps(context.Background(), []string{"origin", "topic"}, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, git, client)
+	if err != nil {
+		t.Fatalf("runWithDeps returned error: %v", err)
+	}
+	if client.createdRefName != "refs/heads/topic" || client.createdRefOID != "base-oid" {
+		t.Fatalf("created ref = %q at %q, want refs/heads/topic at base-oid", client.createdRefName, client.createdRefOID)
+	}
+	if len(client.inputs) != 2 {
+		t.Fatalf("created %d commits, want 2: %#v", len(client.inputs), client.inputs)
+	}
+	if client.inputs[0].ExpectedHeadOID != "base-oid" {
+		t.Fatalf("first expected head = %q, want base-oid", client.inputs[0].ExpectedHeadOID)
+	}
+	if client.inputs[1].ExpectedHeadOID != "signed-1" {
+		t.Fatalf("second expected head = %q, want signed-1", client.inputs[1].ExpectedHeadOID)
+	}
+	if !calledBefore(git.calls, "git fetch origin", "git rev-list --reverse topic --not --remotes=origin") {
+		t.Fatalf("git calls = %#v, want remote refs fetched before finding unpublished commits", git.calls)
+	}
+	if !calledBefore(git.calls, "git diff --quiet topic origin/topic", "git reset --hard base-oid") {
+		t.Fatalf("git calls = %#v, want tree verification before reset", git.calls)
 	}
 }
 
@@ -434,6 +549,7 @@ type fakeGit struct {
 	outputs    map[string]string
 	outputsSeq map[string][]string
 	errors     map[string]error
+	errorsSeq  map[string][]error
 	calls      []string
 }
 
@@ -444,6 +560,13 @@ func newFakeGit(outputs map[string]string) *fakeGit {
 func (g *fakeGit) Run(ctx context.Context, args ...string) (string, error) {
 	key := "git " + strings.Join(args, " ")
 	g.calls = append(g.calls, key)
+	if errors, ok := g.errorsSeq[key]; ok && len(errors) > 0 {
+		err := errors[0]
+		g.errorsSeq[key] = errors[1:]
+		if err != nil {
+			return "", err
+		}
+	}
 	if err, ok := g.errors[key]; ok {
 		return "", err
 	}
@@ -460,10 +583,13 @@ func (g *fakeGit) Run(ctx context.Context, args ...string) (string, error) {
 }
 
 type fakeCommitClient struct {
-	oid    string
-	oids   []string
-	input  CreateCommitInput
-	inputs []CreateCommitInput
+	oid            string
+	oids           []string
+	repoID         string
+	createdRefName string
+	createdRefOID  string
+	input          CreateCommitInput
+	inputs         []CreateCommitInput
 }
 
 func (c *fakeCommitClient) CreateCommitOnBranch(ctx context.Context, input CreateCommitInput) (string, error) {
@@ -475,6 +601,16 @@ func (c *fakeCommitClient) CreateCommitOnBranch(ctx context.Context, input Creat
 		return oid, nil
 	}
 	return c.oid, nil
+}
+
+func (c *fakeCommitClient) RepositoryID(ctx context.Context, remote GitHubRemote) (string, error) {
+	return c.repoID, nil
+}
+
+func (c *fakeCommitClient) CreateRef(ctx context.Context, repositoryID, name, oid string) error {
+	c.createdRefName = name
+	c.createdRefOID = oid
+	return nil
 }
 
 func calledBefore(calls []string, first, second string) bool {

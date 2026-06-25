@@ -39,6 +39,10 @@ signed commit history.
 Commit order and commit messages are preserved. Commit object IDs change because
 GitHub creates new commit objects.
 
+When the target remote branch does not exist, `git-spush` creates it at the
+parent of the oldest local-only commit and then replays the local commits with
+GitHub-created signed commits.
+
 ## Install
 
 ### Go Install
@@ -132,6 +136,8 @@ If either check fails, the command stops without resetting the local branch.
 Supported:
 
 - Existing GitHub remote branches.
+- New GitHub remote branches whose local commits are based on commits already
+  present in the remote.
 - Fast-forward pushes.
 - Multiple local commits.
 - Basic refspecs such as `main` and `HEAD:main`.
@@ -147,7 +153,7 @@ Explicitly unsupported:
 
 Known gaps:
 
-- Creating a new remote branch is not implemented yet.
+- Creating a new remote branch from a local root commit is not implemented yet.
 - Mode-only changes, symlinks, and submodule updates need more investigation
   because `createCommitOnBranch` accepts file content changes, not arbitrary Git
   object updates.
