@@ -119,6 +119,14 @@ Untracked files are ignored, matching normal `git push` behavior.
 If the remote branch has advanced, `git-spush` rejects the push as
 non-fast-forward before creating GitHub commits.
 
+Before running `git reset --hard`, `git-spush` fetches the remote branch again
+and verifies two things:
+
+- the remote branch points to the last commit returned by `createCommitOnBranch`
+- the local ref and the fetched remote branch have the same final tree
+
+If either check fails, the command stops without resetting the local branch.
+
 ## Compatibility With Git Push
 
 Supported:

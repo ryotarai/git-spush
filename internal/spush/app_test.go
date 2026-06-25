@@ -187,15 +187,18 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 		"git diff --cached --quiet":                         "",
 		"git fetch origin main":                             "",
 		"git rev-parse HEAD":                                "local-oid\n",
-		"git rev-parse origin/main":                         "remote-oid\n",
 		"git merge-base --is-ancestor remote-oid local-oid": "",
 		"git rev-list --reverse origin/main..HEAD":          "commit-1\n",
 		"git diff --name-status -z origin/main commit-1":    "M\x00README.md\x00",
 		"git show commit-1:README.md":                       "hello",
 		"git log -1 --format=%B commit-1":                   "update readme\n\nbody\n",
+		"git diff --quiet HEAD origin/main":                 "",
 		"git reset --hard remote-oid":                       "",
 		"git pull --ff-only origin main":                    "",
 	})
+	git.outputsSeq = map[string][]string{
+		"git rev-parse origin/main": {"remote-oid\n", "signed-oid\n"},
+	}
 	client := &fakeCommitClient{oid: "signed-oid"}
 	var out strings.Builder
 
@@ -215,6 +218,9 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 	if !slices.Contains(git.calls, "git pull --ff-only origin main") {
 		t.Fatalf("git calls = %#v, want pull after create", git.calls)
 	}
+	if !calledBefore(git.calls, "git diff --quiet HEAD origin/main", "git reset --hard remote-oid") {
+		t.Fatalf("git calls = %#v, want tree verification before reset", git.calls)
+	}
 	if !calledBefore(git.calls, "git reset --hard remote-oid", "git pull --ff-only origin main") {
 		t.Fatalf("git calls = %#v, want reset to old remote head before pull", git.calls)
 	}
@@ -231,7 +237,6 @@ func TestRunWithDepsCreatesOneSignedCommitPerLocalCommit(t *testing.T) {
 		"git diff --cached --quiet":                        "",
 		"git fetch origin main":                            "",
 		"git rev-parse HEAD":                               "commit-2\n",
-		"git rev-parse origin/main":                        "remote-oid\n",
 		"git merge-base --is-ancestor remote-oid commit-2": "",
 		"git rev-list --reverse origin/main..HEAD":         "commit-1\ncommit-2\n",
 		"git diff --name-status -z origin/main commit-1":   "A\x00one.txt\x00",
@@ -241,9 +246,13 @@ func TestRunWithDepsCreatesOneSignedCommitPerLocalCommit(t *testing.T) {
 		"git show commit-2:one.txt":                        "one updated",
 		"git show commit-2:two.txt":                        "two",
 		"git log -1 --format=%B commit-2":                  "second local commit\n",
+		"git diff --quiet HEAD origin/main":                "",
 		"git reset --hard remote-oid":                      "",
 		"git pull --ff-only origin main":                   "",
 	})
+	git.outputsSeq = map[string][]string{
+		"git rev-parse origin/main": {"remote-oid\n", "signed-2\n"},
+	}
 	client := &fakeCommitClient{oids: []string{"signed-1", "signed-2"}}
 
 	err := runWithDeps(context.Background(), nil, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, git, client)
@@ -271,6 +280,72 @@ func TestRunWithDepsCreatesOneSignedCommitPerLocalCommit(t *testing.T) {
 	if !calledBefore(git.calls, "git diff --name-status -z origin/main commit-1", "git diff --name-status -z commit-1 commit-2") {
 		t.Fatalf("git calls = %#v, want per-commit diffs in order", git.calls)
 	}
+	if !calledBefore(git.calls, "git diff --quiet HEAD origin/main", "git reset --hard remote-oid") {
+		t.Fatalf("git calls = %#v, want tree verification before reset", git.calls)
+	}
+}
+
+func TestRunWithDepsDoesNotResetWhenCreatedRemoteHeadDoesNotMatch(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git branch --show-current":                         "main\n",
+		"git remote get-url origin":                         "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":                                  "",
+		"git diff --cached --quiet":                         "",
+		"git fetch origin main":                             "",
+		"git rev-parse HEAD":                                "local-oid\n",
+		"git merge-base --is-ancestor remote-oid local-oid": "",
+		"git rev-list --reverse origin/main..HEAD":          "commit-1\n",
+		"git diff --name-status -z origin/main commit-1":    "M\x00README.md\x00",
+		"git show commit-1:README.md":                       "hello",
+		"git log -1 --format=%B commit-1":                   "update readme\n",
+	})
+	git.outputsSeq = map[string][]string{
+		"git rev-parse origin/main": {"remote-oid\n", "unexpected-oid\n"},
+	}
+	client := &fakeCommitClient{oid: "signed-oid"}
+
+	err := runWithDeps(context.Background(), nil, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, git, client)
+	if err == nil {
+		t.Fatal("runWithDeps returned nil error for mismatched remote head")
+	}
+	if !strings.Contains(err.Error(), "remote head") {
+		t.Fatalf("error = %q, want remote head mismatch", err)
+	}
+	if slices.Contains(git.calls, "git reset --hard remote-oid") {
+		t.Fatalf("git calls = %#v, reset should not run after verification failure", git.calls)
+	}
+}
+
+func TestRunWithDepsDoesNotResetWhenCreatedRemoteTreeDiffers(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git branch --show-current":                         "main\n",
+		"git remote get-url origin":                         "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":                                  "",
+		"git diff --cached --quiet":                         "",
+		"git fetch origin main":                             "",
+		"git rev-parse HEAD":                                "local-oid\n",
+		"git merge-base --is-ancestor remote-oid local-oid": "",
+		"git rev-list --reverse origin/main..HEAD":          "commit-1\n",
+		"git diff --name-status -z origin/main commit-1":    "M\x00README.md\x00",
+		"git show commit-1:README.md":                       "hello",
+		"git log -1 --format=%B commit-1":                   "update readme\n",
+	})
+	git.outputsSeq = map[string][]string{
+		"git rev-parse origin/main": {"remote-oid\n", "signed-oid\n"},
+	}
+	git.errors = map[string]error{"git diff --quiet HEAD origin/main": fmt.Errorf("trees differ")}
+	client := &fakeCommitClient{oid: "signed-oid"}
+
+	err := runWithDeps(context.Background(), nil, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, git, client)
+	if err == nil {
+		t.Fatal("runWithDeps returned nil error for differing remote tree")
+	}
+	if !strings.Contains(err.Error(), "remote tree") {
+		t.Fatalf("error = %q, want remote tree mismatch", err)
+	}
+	if slices.Contains(git.calls, "git reset --hard remote-oid") {
+		t.Fatalf("git calls = %#v, reset should not run after verification failure", git.calls)
+	}
 }
 
 func TestRunWithDepsSetUpstreamConfiguresTrackingBranch(t *testing.T) {
@@ -280,16 +355,19 @@ func TestRunWithDepsSetUpstreamConfiguresTrackingBranch(t *testing.T) {
 		"git diff --cached --quiet":                         "",
 		"git fetch origin topic":                            "",
 		"git rev-parse topic":                               "local-oid\n",
-		"git rev-parse origin/topic":                        "remote-oid\n",
 		"git merge-base --is-ancestor remote-oid local-oid": "",
 		"git rev-list --reverse origin/topic..topic":        "topic\n",
 		"git diff --name-status -z origin/topic topic":      "M\x00README.md\x00",
 		"git show topic:README.md":                          "hello",
 		"git log -1 --format=%B topic":                      "update readme\n",
+		"git diff --quiet topic origin/topic":               "",
 		"git reset --hard remote-oid":                       "",
 		"git pull --ff-only origin topic":                   "",
 		"git branch --set-upstream-to=origin/topic topic":   "",
 	})
+	git.outputsSeq = map[string][]string{
+		"git rev-parse origin/topic": {"remote-oid\n", "signed-oid\n"},
+	}
 	client := &fakeCommitClient{oid: "signed-oid"}
 
 	err := runWithDeps(context.Background(), []string{"-u", "origin", "topic"}, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, git, client)
@@ -353,9 +431,10 @@ func TestGitHubTokenPrefersGitHubToken(t *testing.T) {
 }
 
 type fakeGit struct {
-	outputs map[string]string
-	errors  map[string]error
-	calls   []string
+	outputs    map[string]string
+	outputsSeq map[string][]string
+	errors     map[string]error
+	calls      []string
 }
 
 func newFakeGit(outputs map[string]string) *fakeGit {
@@ -367,6 +446,11 @@ func (g *fakeGit) Run(ctx context.Context, args ...string) (string, error) {
 	g.calls = append(g.calls, key)
 	if err, ok := g.errors[key]; ok {
 		return "", err
+	}
+	if outputs, ok := g.outputsSeq[key]; ok && len(outputs) > 0 {
+		out := outputs[0]
+		g.outputsSeq[key] = outputs[1:]
+		return out, nil
 	}
 	out, ok := g.outputs[key]
 	if !ok {

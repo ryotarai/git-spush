@@ -210,6 +210,9 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 		fmt.Fprintln(stdout, "Everything up-to-date")
 		return nil
 	}
+	if err := verifyCreatedRemoteBeforeReset(ctx, git, options.Remote, options.RemoteBranch, remoteRef, options.LocalRef, expectedHeadOID); err != nil {
+		return err
+	}
 
 	if _, err := git.Run(ctx, "reset", "--hard", remoteOID); err != nil {
 		return fmt.Errorf("created %d commits, but resetting local branch before pull failed: %w", len(createdOIDs), err)
@@ -500,6 +503,23 @@ func ensureCleanWorktree(ctx context.Context, git GitRunner) error {
 	}
 	if _, err := git.Run(ctx, "diff", "--cached", "--quiet"); err != nil {
 		return errors.New("index has uncommitted changes; commit or stash them before git-spush")
+	}
+	return nil
+}
+
+func verifyCreatedRemoteBeforeReset(ctx context.Context, git GitRunner, remote, remoteBranch, remoteRef, localRef, expectedHeadOID string) error {
+	if _, err := git.Run(ctx, "fetch", remote, remoteBranch); err != nil {
+		return fmt.Errorf("created remote commits, but verifying remote before reset failed: %w", err)
+	}
+	actualHeadOID, err := trimmedGit(ctx, git, "rev-parse", remoteRef)
+	if err != nil {
+		return fmt.Errorf("created remote commits, but resolving %s before reset failed: %w", remoteRef, err)
+	}
+	if actualHeadOID != expectedHeadOID {
+		return fmt.Errorf("created remote commits, but remote head verification failed before reset: %s is %s, want %s", remoteRef, actualHeadOID, expectedHeadOID)
+	}
+	if _, err := git.Run(ctx, "diff", "--quiet", localRef, remoteRef); err != nil {
+		return fmt.Errorf("created remote commits, but remote tree verification failed before reset: %s differs from %s", remoteRef, localRef)
 	}
 	return nil
 }
