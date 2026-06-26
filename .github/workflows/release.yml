@@ -88,3 +88,96 @@ jobs:
               --title "${tag}" \
               --generate-notes
           fi
+
+  update-homebrew:
+    name: Update Homebrew tap
+    runs-on: ubuntu-latest
+    needs: release
+    environment: main
+
+    steps:
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: ryotarai/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Compute checksums and update formula
+        env:
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+
+          download_and_sha256() {
+            local asset="$1"
+            local url="https://github.com/ryotarai/git-spush/releases/download/${TAG}/${asset}"
+            curl -fsSL "${url}" -o "/tmp/${asset}"
+            sha256sum "/tmp/${asset}" | awk '{print $1}'
+          }
+
+          sha256_darwin_amd64="$(download_and_sha256 "git-spush_${TAG}_darwin_amd64.tar.gz")"
+          sha256_darwin_arm64="$(download_and_sha256 "git-spush_${TAG}_darwin_arm64.tar.gz")"
+          sha256_linux_amd64="$(download_and_sha256 "git-spush_${TAG}_linux_amd64.tar.gz")"
+          sha256_linux_arm64="$(download_and_sha256 "git-spush_${TAG}_linux_arm64.tar.gz")"
+
+          cat > homebrew-tap/Formula/git-spush.rb <<FORMULA_END
+          class GitSpush < Formula
+            desc "Create GitHub-signed commits through GitHub instead of git push"
+            homepage "https://github.com/ryotarai/git-spush"
+            version "${version}"
+            license "MIT"
+
+            on_macos do
+              on_intel do
+                url "https://github.com/ryotarai/git-spush/releases/download/v#{version}/git-spush_v#{version}_darwin_amd64.tar.gz"
+                sha256 "${sha256_darwin_amd64}"
+              end
+              on_arm do
+                url "https://github.com/ryotarai/git-spush/releases/download/v#{version}/git-spush_v#{version}_darwin_arm64.tar.gz"
+                sha256 "${sha256_darwin_arm64}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/ryotarai/git-spush/releases/download/v#{version}/git-spush_v#{version}_linux_amd64.tar.gz"
+                sha256 "${sha256_linux_amd64}"
+              end
+              on_arm do
+                url "https://github.com/ryotarai/git-spush/releases/download/v#{version}/git-spush_v#{version}_linux_arm64.tar.gz"
+                sha256 "${sha256_linux_arm64}"
+              end
+            end
+
+            def install
+              bin.install "git-spush"
+            end
+
+            test do
+              assert_match "unsupported option --version", shell_output("#{bin}/git-spush --version 2>&1", 1)
+            end
+          end
+          FORMULA_END
+
+      - name: Commit and push updated formula
+        env:
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/git-spush.rb
+          if git diff --cached --quiet; then
+            echo "Formula/git-spush.rb is already up to date"
+            exit 0
+          fi
+          git commit -m "Update git-spush to ${version}"
+          git push
