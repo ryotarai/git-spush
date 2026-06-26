@@ -12,7 +12,7 @@ verified as GitHub-signed commits.
 Install the command:
 
 ```sh
-go install github.com/ryotarai/git-spush/cmd/git-spush@latest
+brew install ryotarai/tap/git-spush
 ```
 
 Push the current branch to `origin/<current-branch>`:
@@ -44,6 +44,12 @@ parent of the oldest local-only commit and then replays the local commits with
 GitHub-created signed commits.
 
 ## Install
+
+### Homebrew
+
+```sh
+brew install ryotarai/tap/git-spush
+```
 
 ### Go Install
 
