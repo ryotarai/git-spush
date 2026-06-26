@@ -22,6 +22,26 @@ type PushOptions struct {
 	LocalRef     string
 	RemoteBranch string
 	SetUpstream  bool
+	Quiet        bool
+	Verbose      bool
+	OutputFormat OutputFormat
+}
+
+type OutputFormat string
+
+const (
+	OutputText      OutputFormat = ""
+	OutputJSON      OutputFormat = "json"
+	OutputPorcelain OutputFormat = "porcelain"
+)
+
+type pushResult struct {
+	Status       string   `json:"status"`
+	Remote       string   `json:"remote"`
+	Branch       string   `json:"branch"`
+	RemoteRef    string   `json:"remoteRef"`
+	Commits      []string `json:"commits"`
+	UpdatedLocal bool     `json:"updatedLocal"`
 }
 
 type GitHubRemote struct {
@@ -53,6 +73,32 @@ func (execGit) Run(ctx context.Context, args ...string) (string, error) {
 		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
 	}
 	return stdout.String(), nil
+}
+
+type verboseGit struct {
+	git    GitRunner
+	stderr io.Writer
+}
+
+func (g verboseGit) Run(ctx context.Context, args ...string) (string, error) {
+	fmt.Fprintf(g.stderr, "git %s\n", strings.Join(args, " "))
+	return g.git.Run(ctx, args...)
+}
+
+type progressWriter struct {
+	stderr io.Writer
+	quiet  bool
+}
+
+func newProgressWriter(stderr io.Writer, options PushOptions) progressWriter {
+	return progressWriter{stderr: stderr, quiet: options.Quiet}
+}
+
+func (w progressWriter) printf(format string, args ...any) {
+	if w.quiet {
+		return
+	}
+	fmt.Fprintf(w.stderr, format, args...)
 }
 
 type FileAddition struct {
@@ -101,24 +147,32 @@ func NewGitHubClient(endpoint, token string) *GitHubClient {
 }
 
 func Main(ctx context.Context, args []string, env []string, stdout, stderr io.Writer) int {
-	if err := Run(ctx, args, env, stdout); err != nil {
+	if err := Run(ctx, args, env, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "git-spush: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func Run(ctx context.Context, args []string, env []string, stdout io.Writer) error {
+func Run(ctx context.Context, args []string, env []string, stdout, stderr io.Writer) error {
 	environment := envMap(env)
 	endpoint := environment["GITHUB_GRAPHQL_URL"]
 	client := NewGitHubClient(endpoint, "")
-	return runWithDeps(ctx, args, environment, stdout, execGit{}, client)
+	return runWithDepsIO(ctx, args, environment, stdout, stderr, execGit{}, client)
 }
 
 func runWithDeps(ctx context.Context, args []string, environment map[string]string, stdout io.Writer, git GitRunner, client commitClient) error {
+	return runWithDepsIO(ctx, args, environment, stdout, io.Discard, git, client)
+}
+
+func runWithDepsIO(ctx context.Context, args []string, environment map[string]string, stdout, stderr io.Writer, git GitRunner, client commitClient) error {
 	options, err := ParsePushArgs(args)
 	if err != nil {
 		return err
+	}
+	progress := newProgressWriter(stderr, options)
+	if options.Verbose && !options.Quiet {
+		git = verboseGit{git: git, stderr: stderr}
 	}
 
 	if options.RemoteBranch == "" {
@@ -143,12 +197,13 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 	}
 
 	remoteRef := options.Remote + "/" + options.RemoteBranch
+	progress.printf("Fetching %s\n", remoteRef)
 	remoteBranchExists, err := fetchRemoteBranch(ctx, git, options.Remote, options.RemoteBranch)
 	if err != nil {
 		return err
 	}
 	if !remoteBranchExists {
-		return createNewRemoteBranch(ctx, git, client, remote, options, remoteRef, environment, stdout)
+		return createNewRemoteBranch(ctx, git, client, remote, options, remoteRef, environment, stdout, progress)
 	}
 
 	localOID, err := trimmedGit(ctx, git, "rev-parse", options.LocalRef)
@@ -160,8 +215,7 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 		return fmt.Errorf("resolve remote ref %q: %w", remoteRef, err)
 	}
 	if localOID == remoteOID {
-		fmt.Fprintln(stdout, "Everything up-to-date")
-		return nil
+		return writeResult(stdout, options, pushResult{Status: "up-to-date", Remote: options.Remote, Branch: options.RemoteBranch, RemoteRef: remoteRef})
 	}
 	if _, err := git.Run(ctx, "merge-base", "--is-ancestor", remoteOID, localOID); err != nil {
 		return fmt.Errorf("remote %s is not an ancestor of %s; non-fast-forward pushes are not supported", remoteRef, options.LocalRef)
@@ -172,9 +226,9 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 		return err
 	}
 	if len(commits) == 0 {
-		fmt.Fprintln(stdout, "Everything up-to-date")
-		return nil
+		return writeResult(stdout, options, pushResult{Status: "up-to-date", Remote: options.Remote, Branch: options.RemoteBranch, RemoteRef: remoteRef})
 	}
+	progress.printf("Replaying %d %s as GitHub-signed %s\n", len(commits), plural("commit", len(commits)), plural("commit", len(commits)))
 
 	token, err := githubToken(ctx, git, environment)
 	if err != nil {
@@ -216,13 +270,14 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 		baseRef = commit
 	}
 	if len(createdOIDs) == 0 {
-		fmt.Fprintln(stdout, "Everything up-to-date")
-		return nil
+		return writeResult(stdout, options, pushResult{Status: "up-to-date", Remote: options.Remote, Branch: options.RemoteBranch, RemoteRef: remoteRef})
 	}
+	progress.printf("Verifying %s\n", remoteRef)
 	if err := verifyCreatedRemoteBeforeReset(ctx, git, options.Remote, options.RemoteBranch, remoteRef, options.LocalRef, expectedHeadOID); err != nil {
 		return err
 	}
 
+	progress.printf("Updating local branch\n")
 	if _, err := git.Run(ctx, "reset", "--hard", remoteOID); err != nil {
 		return fmt.Errorf("created %d commits, but resetting local branch before pull failed: %w", len(createdOIDs), err)
 	}
@@ -236,12 +291,14 @@ func runWithDeps(ctx context.Context, args []string, environment map[string]stri
 			return fmt.Errorf("created %d commits and pulled them, but setting upstream failed: %w", len(createdOIDs), err)
 		}
 	}
-	if len(createdOIDs) == 1 {
-		fmt.Fprintf(stdout, "Created GitHub-signed commit %s and updated local branch\n", createdOIDs[0])
-		return nil
-	}
-	fmt.Fprintf(stdout, "Created %d GitHub-signed commits and updated local branch\n", len(createdOIDs))
-	return nil
+	return writeResult(stdout, options, pushResult{
+		Status:       "created",
+		Remote:       options.Remote,
+		Branch:       options.RemoteBranch,
+		RemoteRef:    remoteRef,
+		Commits:      createdOIDs,
+		UpdatedLocal: true,
+	})
 }
 
 func ParsePushArgs(args []string) (PushOptions, error) {
@@ -251,6 +308,20 @@ func ParsePushArgs(args []string) (PushOptions, error) {
 		switch arg {
 		case "-u", "--set-upstream":
 			options.SetUpstream = true
+		case "--quiet":
+			options.Quiet = true
+		case "--verbose":
+			options.Verbose = true
+		case "--json":
+			if options.OutputFormat != OutputText {
+				return PushOptions{}, errors.New("only one output format may be specified")
+			}
+			options.OutputFormat = OutputJSON
+		case "--porcelain":
+			if options.OutputFormat != OutputText {
+				return PushOptions{}, errors.New("only one output format may be specified")
+			}
+			options.OutputFormat = OutputPorcelain
 		case "--force", "-f", "--force-with-lease":
 			return PushOptions{}, fmt.Errorf("%s is not supported because createCommitOnBranch only supports fast-forward branch updates", arg)
 		default:
@@ -570,6 +641,47 @@ func graphQLFileChanges(changes FileChanges) map[string]any {
 	return out
 }
 
+func writeResult(stdout io.Writer, options PushOptions, result pushResult) error {
+	switch options.OutputFormat {
+	case OutputJSON:
+		encoded, err := json.Marshal(result)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "%s\n", encoded)
+	case OutputPorcelain:
+		fmt.Fprintf(stdout, "status %s\n", result.Status)
+		fmt.Fprintf(stdout, "remote %s\n", result.Remote)
+		fmt.Fprintf(stdout, "branch %s\n", result.Branch)
+		fmt.Fprintf(stdout, "remote-ref %s\n", result.RemoteRef)
+		for _, commit := range result.Commits {
+			fmt.Fprintf(stdout, "commit %s\n", commit)
+		}
+		fmt.Fprintf(stdout, "updated-local %t\n", result.UpdatedLocal)
+	default:
+		switch result.Status {
+		case "up-to-date":
+			fmt.Fprintln(stdout, "Everything up-to-date")
+		case "created-branch":
+			fmt.Fprintf(stdout, "Created remote branch %s\n", result.RemoteRef)
+		case "created":
+			if len(result.Commits) == 1 {
+				fmt.Fprintf(stdout, "Created GitHub-signed commit %s and updated local branch\n", result.Commits[0])
+			} else {
+				fmt.Fprintf(stdout, "Created %d GitHub-signed commits and updated local branch\n", len(result.Commits))
+			}
+		}
+	}
+	return nil
+}
+
+func plural(word string, count int) string {
+	if count == 1 {
+		return word
+	}
+	return word + "s"
+}
+
 func currentBranch(ctx context.Context, git GitRunner) (string, error) {
 	return trimmedGit(ctx, git, "branch", "--show-current")
 }
@@ -677,11 +789,12 @@ func isMissingRemoteRefError(err error) bool {
 	return strings.Contains(err.Error(), "couldn't find remote ref")
 }
 
-func createNewRemoteBranch(ctx context.Context, git GitRunner, client commitClient, remote GitHubRemote, options PushOptions, remoteRef string, environment map[string]string, stdout io.Writer) error {
+func createNewRemoteBranch(ctx context.Context, git GitRunner, client commitClient, remote GitHubRemote, options PushOptions, remoteRef string, environment map[string]string, stdout io.Writer, progress progressWriter) error {
 	refCreator, ok := client.(refClient)
 	if !ok {
 		return errors.New("GitHub client does not support creating refs")
 	}
+	progress.printf("Fetching %s\n", options.Remote)
 	if _, err := git.Run(ctx, "fetch", options.Remote); err != nil {
 		return err
 	}
@@ -707,9 +820,11 @@ func createNewRemoteBranch(ctx context.Context, git GitRunner, client commitClie
 	}
 
 	if len(commits) == 0 {
+		progress.printf("Creating remote branch %s at %s\n", remoteRef, localOID)
 		if err := refCreator.CreateRef(ctx, repositoryID, "refs/heads/"+options.RemoteBranch, localOID); err != nil {
 			return err
 		}
+		progress.printf("Verifying %s\n", remoteRef)
 		if err := verifyCreatedRemoteBeforeReset(ctx, git, options.Remote, options.RemoteBranch, remoteRef, options.LocalRef, localOID); err != nil {
 			return err
 		}
@@ -719,14 +834,14 @@ func createNewRemoteBranch(ctx context.Context, git GitRunner, client commitClie
 				return fmt.Errorf("created remote branch, but setting upstream failed: %w", err)
 			}
 		}
-		fmt.Fprintf(stdout, "Created remote branch %s\n", remoteRef)
-		return nil
+		return writeResult(stdout, options, pushResult{Status: "created-branch", Remote: options.Remote, Branch: options.RemoteBranch, RemoteRef: remoteRef})
 	}
 
 	baseOID, err := trimmedGit(ctx, git, "rev-parse", commits[0]+"^")
 	if err != nil {
-		return fmt.Errorf("resolve new branch base for %s: %w", commits[0], err)
+		return errors.New("creating a new branch from a root commit is not supported yet")
 	}
+	progress.printf("Creating remote branch %s at %s\n", remoteRef, baseOID)
 	if err := refCreator.CreateRef(ctx, repositoryID, "refs/heads/"+options.RemoteBranch, baseOID); err != nil {
 		return err
 	}
@@ -734,6 +849,7 @@ func createNewRemoteBranch(ctx context.Context, git GitRunner, client commitClie
 	expectedHeadOID := baseOID
 	baseRef := baseOID
 	createdOIDs := make([]string, 0, len(commits))
+	progress.printf("Replaying %d %s as GitHub-signed %s\n", len(commits), plural("commit", len(commits)), plural("commit", len(commits)))
 	for _, commit := range commits {
 		changes, err := BuildFileChanges(ctx, git, baseRef, commit)
 		if err != nil {
@@ -763,12 +879,13 @@ func createNewRemoteBranch(ctx context.Context, git GitRunner, client commitClie
 		baseRef = commit
 	}
 	if len(createdOIDs) == 0 {
-		fmt.Fprintln(stdout, "Everything up-to-date")
-		return nil
+		return writeResult(stdout, options, pushResult{Status: "up-to-date", Remote: options.Remote, Branch: options.RemoteBranch, RemoteRef: remoteRef})
 	}
+	progress.printf("Verifying %s\n", remoteRef)
 	if err := verifyCreatedRemoteBeforeReset(ctx, git, options.Remote, options.RemoteBranch, remoteRef, options.LocalRef, expectedHeadOID); err != nil {
 		return err
 	}
+	progress.printf("Updating local branch\n")
 	if _, err := git.Run(ctx, "reset", "--hard", baseOID); err != nil {
 		return fmt.Errorf("created %d commits, but resetting local branch before pull failed: %w", len(createdOIDs), err)
 	}
@@ -782,12 +899,14 @@ func createNewRemoteBranch(ctx context.Context, git GitRunner, client commitClie
 			return fmt.Errorf("created %d commits and pulled them, but setting upstream failed: %w", len(createdOIDs), err)
 		}
 	}
-	if len(createdOIDs) == 1 {
-		fmt.Fprintf(stdout, "Created GitHub-signed commit %s and updated local branch\n", createdOIDs[0])
-		return nil
-	}
-	fmt.Fprintf(stdout, "Created %d GitHub-signed commits and updated local branch\n", len(createdOIDs))
-	return nil
+	return writeResult(stdout, options, pushResult{
+		Status:       "created",
+		Remote:       options.Remote,
+		Branch:       options.RemoteBranch,
+		RemoteRef:    remoteRef,
+		Commits:      createdOIDs,
+		UpdatedLocal: true,
+	})
 }
 
 func trimmedGit(ctx context.Context, git GitRunner, args ...string) (string, error) {

@@ -87,6 +87,12 @@ git-spush origin HEAD:main
 
 # Push topic and set upstream to origin/topic.
 git-spush -u origin topic
+
+# Print a machine-readable JSON result.
+git-spush --json origin topic
+
+# Print a stable line-oriented result.
+git-spush --porcelain origin topic
 ```
 
 Defaults:
@@ -95,6 +101,13 @@ Defaults:
 - If no refspec is provided, the current branch is pushed to the same branch name.
 - `-u` / `--set-upstream` configures the upstream after the signed commits are
   pulled.
+- `--quiet` suppresses progress output.
+- `--verbose` prints progress plus the `git` commands run by `git-spush`.
+- `--json` prints the final result as JSON on stdout.
+- `--porcelain` prints the final result as stable key-value lines on stdout.
+
+`git-spush` writes final results to stdout. Progress and error messages are
+written to stderr, matching Git's convention for command-line tools.
 
 ## Authentication
 

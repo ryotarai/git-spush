@@ -68,6 +68,16 @@ func TestParsePushArgs(t *testing.T) {
 			args: []string{"-u", "origin", "topic"},
 			want: PushOptions{Remote: "origin", LocalRef: "topic", RemoteBranch: "topic", SetUpstream: true},
 		},
+		{
+			name: "accept output flags",
+			args: []string{"--quiet", "--verbose", "--json", "origin", "HEAD:main"},
+			want: PushOptions{Remote: "origin", LocalRef: "HEAD", RemoteBranch: "main", Quiet: true, Verbose: true, OutputFormat: OutputJSON},
+		},
+		{
+			name: "accept porcelain output",
+			args: []string{"--porcelain", "origin", "topic"},
+			want: PushOptions{Remote: "origin", LocalRef: "topic", RemoteBranch: "topic", OutputFormat: OutputPorcelain},
+		},
 	}
 
 	for _, tt := range tests {
@@ -90,6 +100,16 @@ func TestParsePushArgsRejectsUnsupportedForce(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--force") {
 		t.Fatalf("error = %q, want it to mention --force", err)
+	}
+}
+
+func TestParsePushArgsRejectsMultipleStructuredOutputFormats(t *testing.T) {
+	_, err := ParsePushArgs([]string{"--json", "--porcelain", "origin", "main"})
+	if err == nil {
+		t.Fatal("ParsePushArgs returned nil error for multiple output formats")
+	}
+	if !strings.Contains(err.Error(), "only one output format") {
+		t.Fatalf("error = %q, want output format message", err)
 	}
 }
 
@@ -291,6 +311,162 @@ func TestRunWithDepsCreatesCommitAndPulls(t *testing.T) {
 	}
 }
 
+func TestRunWithDepsWritesProgressToStderr(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git branch --show-current":                         "main\n",
+		"git remote get-url origin":                         "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":                                  "",
+		"git diff --cached --quiet":                         "",
+		"git fetch origin main":                             "",
+		"git rev-parse HEAD":                                "local-oid\n",
+		"git merge-base --is-ancestor remote-oid local-oid": "",
+		"git rev-list --reverse origin/main..HEAD":          "commit-1\n",
+		"git diff --name-status -z origin/main commit-1":    "M\x00README.md\x00",
+		"git show commit-1:README.md":                       "hello",
+		"git log -1 --format=%B commit-1":                   "update readme\n",
+		"git diff --quiet HEAD origin/main":                 "",
+		"git reset --hard remote-oid":                       "",
+		"git pull --ff-only origin main":                    "",
+	})
+	git.outputsSeq = map[string][]string{
+		"git rev-parse origin/main": {"remote-oid\n", "signed-oid\n"},
+	}
+	client := &fakeCommitClient{oid: "signed-oid"}
+	var stdout strings.Builder
+	var stderr strings.Builder
+
+	err := runWithDepsIO(context.Background(), nil, map[string]string{"GITHUB_TOKEN": "token"}, &stdout, &stderr, git, client)
+	if err != nil {
+		t.Fatalf("runWithDepsIO returned error: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "Fetching origin/main") ||
+		!strings.Contains(stderr.String(), "Replaying 1 commit as GitHub-signed commit") ||
+		!strings.Contains(stderr.String(), "Verifying origin/main") ||
+		!strings.Contains(stderr.String(), "Updating local branch") {
+		t.Fatalf("stderr = %q, want progress messages", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Created GitHub-signed commit signed-oid") {
+		t.Fatalf("stdout = %q, want final result", stdout.String())
+	}
+}
+
+func TestRunWithDepsQuietSuppressesProgress(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git branch --show-current": "main\n",
+		"git remote get-url origin": "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":          "",
+		"git diff --cached --quiet": "",
+		"git fetch origin main":     "",
+		"git rev-parse HEAD":        "remote-oid\n",
+		"git rev-parse origin/main": "remote-oid\n",
+	})
+	var stdout strings.Builder
+	var stderr strings.Builder
+
+	err := runWithDepsIO(context.Background(), []string{"--quiet"}, map[string]string{"GITHUB_TOKEN": "token"}, &stdout, &stderr, git, &fakeCommitClient{})
+	if err != nil {
+		t.Fatalf("runWithDepsIO returned error: %v", err)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want quiet progress suppressed", stderr.String())
+	}
+	if stdout.String() != "Everything up-to-date\n" {
+		t.Fatalf("stdout = %q, want up-to-date result", stdout.String())
+	}
+}
+
+func TestRunWithDepsVerboseWritesGitCommandsToStderr(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git branch --show-current": "main\n",
+		"git remote get-url origin": "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":          "",
+		"git diff --cached --quiet": "",
+		"git fetch origin main":     "",
+		"git rev-parse HEAD":        "remote-oid\n",
+		"git rev-parse origin/main": "remote-oid\n",
+	})
+	var stderr strings.Builder
+
+	err := runWithDepsIO(context.Background(), []string{"--verbose"}, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, &stderr, git, &fakeCommitClient{})
+	if err != nil {
+		t.Fatalf("runWithDepsIO returned error: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "git fetch origin main") {
+		t.Fatalf("stderr = %q, want verbose git command", stderr.String())
+	}
+}
+
+func TestRunWithDepsJSONOutput(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git branch --show-current":                         "main\n",
+		"git remote get-url origin":                         "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":                                  "",
+		"git diff --cached --quiet":                         "",
+		"git fetch origin main":                             "",
+		"git rev-parse HEAD":                                "local-oid\n",
+		"git merge-base --is-ancestor remote-oid local-oid": "",
+		"git rev-list --reverse origin/main..HEAD":          "commit-1\ncommit-2\n",
+		"git diff --name-status -z origin/main commit-1":    "A\x00one.txt\x00",
+		"git show commit-1:one.txt":                         "one",
+		"git log -1 --format=%B commit-1":                   "first\n",
+		"git diff --name-status -z commit-1 commit-2":       "A\x00two.txt\x00",
+		"git show commit-2:two.txt":                         "two",
+		"git log -1 --format=%B commit-2":                   "second\n",
+		"git diff --quiet HEAD origin/main":                 "",
+		"git reset --hard remote-oid":                       "",
+		"git pull --ff-only origin main":                    "",
+	})
+	git.outputsSeq = map[string][]string{
+		"git rev-parse origin/main": {"remote-oid\n", "signed-2\n"},
+	}
+	client := &fakeCommitClient{oids: []string{"signed-1", "signed-2"}}
+	var stdout strings.Builder
+
+	err := runWithDepsIO(context.Background(), []string{"--json"}, map[string]string{"GITHUB_TOKEN": "token"}, &stdout, io.Discard, git, client)
+	if err != nil {
+		t.Fatalf("runWithDepsIO returned error: %v", err)
+	}
+	var got struct {
+		Status       string   `json:"status"`
+		Remote       string   `json:"remote"`
+		Branch       string   `json:"branch"`
+		RemoteRef    string   `json:"remoteRef"`
+		Commits      []string `json:"commits"`
+		UpdatedLocal bool     `json:"updatedLocal"`
+	}
+	if err := json.Unmarshal([]byte(stdout.String()), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v; stdout=%q", err, stdout.String())
+	}
+	if got.Status != "created" || got.Remote != "origin" || got.Branch != "main" || got.RemoteRef != "origin/main" || !got.UpdatedLocal {
+		t.Fatalf("json result = %#v", got)
+	}
+	if !slices.Equal(got.Commits, []string{"signed-1", "signed-2"}) {
+		t.Fatalf("commits = %#v, want signed commits", got.Commits)
+	}
+}
+
+func TestRunWithDepsPorcelainOutput(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git branch --show-current": "main\n",
+		"git remote get-url origin": "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":          "",
+		"git diff --cached --quiet": "",
+		"git fetch origin main":     "",
+		"git rev-parse HEAD":        "remote-oid\n",
+		"git rev-parse origin/main": "remote-oid\n",
+	})
+	var stdout strings.Builder
+
+	err := runWithDepsIO(context.Background(), []string{"--porcelain"}, map[string]string{"GITHUB_TOKEN": "token"}, &stdout, io.Discard, git, &fakeCommitClient{})
+	if err != nil {
+		t.Fatalf("runWithDepsIO returned error: %v", err)
+	}
+	want := "status up-to-date\nremote origin\nbranch main\nremote-ref origin/main\nupdated-local false\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
 func TestRunWithDepsCreatesNewRemoteBranchAndSignedCommits(t *testing.T) {
 	git := newFakeGit(map[string]string{
 		"git remote get-url origin":                           "git@github.com:ryotarai/git-spush.git\n",
@@ -341,6 +517,36 @@ func TestRunWithDepsCreatesNewRemoteBranchAndSignedCommits(t *testing.T) {
 	}
 	if !calledBefore(git.calls, "git diff --quiet topic origin/topic", "git reset --hard base-oid") {
 		t.Fatalf("git calls = %#v, want tree verification before reset", git.calls)
+	}
+}
+
+func TestRunWithDepsNewRootBranchReturnsClearUnsupportedError(t *testing.T) {
+	git := newFakeGit(map[string]string{
+		"git remote get-url origin":                          "git@github.com:ryotarai/git-spush.git\n",
+		"git diff --quiet":                                   "",
+		"git diff --cached --quiet":                          "",
+		"git fetch origin root":                              "",
+		"git fetch origin":                                   "",
+		"git rev-parse root":                                 "root-commit\n",
+		"git rev-list --reverse root --not --remotes=origin": "root-commit\n",
+	})
+	git.errorsSeq = map[string][]error{
+		"git fetch origin root": {fmt.Errorf("git fetch origin root: fatal: couldn't find remote ref root"), nil},
+	}
+	git.errors = map[string]error{
+		"git rev-parse root-commit^": fmt.Errorf("git rev-parse root-commit^: ambiguous argument 'root-commit^'"),
+	}
+	client := &fakeCommitClient{repoID: "repo-id"}
+
+	err := runWithDepsIO(context.Background(), []string{"origin", "root"}, map[string]string{"GITHUB_TOKEN": "token"}, io.Discard, io.Discard, git, client)
+	if err == nil {
+		t.Fatal("runWithDepsIO returned nil error for root branch")
+	}
+	if !strings.Contains(err.Error(), "creating a new branch from a root commit is not supported yet") {
+		t.Fatalf("error = %q, want clear root commit unsupported message", err)
+	}
+	if client.createdRefName != "" {
+		t.Fatalf("created ref despite root unsupported error: %s", client.createdRefName)
 	}
 }
 
